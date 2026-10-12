@@ -159,7 +159,8 @@ export function ChatApp() {
         </div>
       </div>
 
-      <main className="relative flex min-h-0 flex-1 flex-col">
+      {/* a div, not <main>: the route already declares the page landmark */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
         {/* brief pills — live values echoed back by the classifier */}
         <div className="mx-auto w-full max-w-4xl px-5 pt-5">
           <div className="flex flex-wrap gap-2">
@@ -384,7 +385,7 @@ export function ChatApp() {
             </div>
           </div>
         </div>
-      </main>
+      </div>
     </div>
   );
 }
