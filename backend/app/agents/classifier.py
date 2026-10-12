@@ -2,26 +2,106 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 
-from app.agents.state import REQUIRED_FIELDS, TravelDetails, TravelPlannerState
+from pydantic import BaseModel, Field
+
+from app.agents.state import ALL_MODES, REQUIRED_FIELDS, TravelDetails, TravelPlannerState
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 CLASSIFIER_SYSTEM = """You extract travel details from a user message.
 Return ONLY the structured fields: origin, destination, travel_date (YYYY-MM-DD),
 return_date (YYYY-MM-DD), passengers, budget_inr, preferred_modes (subset of
 train/flight/bus/cab/transit), intent (travel_search|price_check|booking_help|other),
-confidence (0-1). Leave unknown fields null/empty. Never invent cities."""
+confidence (0-1). Leave unknown fields null/empty. Never invent cities — but do keep
+non-city endpoints the user names (landmarks, terminals, 'the airport', stations).
+The message may open with 'Latest message: ... Trip context: ...': the latest message
+is what the user just said, and the context is what was already agreed."""
+
+
+class ClassifierFields(BaseModel):
+    """LLM-facing extraction schema.
+
+    Every field is nullable: the prompt tells the model to null out anything the
+    message doesn't state, and providers that validate tool arguments against the
+    schema (Groq does) reject `null` for non-optional types. `extract_travel_details`
+    normalises the result into `TravelDetails` — the typed contract the graph runs on.
+    """
+
+    origin: str | None = Field(default=None, description="Origin city/station")
+    destination: str | None = Field(default=None, description="Destination city/station")
+    travel_date: str | None = Field(default=None, description="Travel date, YYYY-MM-DD if known")
+    return_date: str | None = Field(default=None, description="Return date, YYYY-MM-DD if known")
+    passengers: int | None = Field(default=None, description="Number of travellers if stated")
+    budget_inr: float | None = Field(default=None, description="Budget in INR if stated")
+    preferred_modes: list[str] | None = Field(
+        default=None, description="Subset of train/flight/bus/cab/transit if stated"
+    )
+    intent: str | None = Field(
+        default=None, description="travel_search | price_check | booking_help | other"
+    )
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="0-1")
+
+
+VALID_INTENTS = ("travel_search", "price_check", "booking_help", "other")
+
+
+def normalise(raw: ClassifierFields, message: str) -> TravelDetails:
+    """Map a nullable LLM extraction onto the non-optional state contract."""
+    modes = [
+        mode
+        for mode in (m.strip().lower() for m in (raw.preferred_modes or []))
+        if mode in ALL_MODES
+    ]
+    return TravelDetails(
+        origin=raw.origin,
+        destination=raw.destination,
+        travel_date=raw.travel_date,
+        return_date=raw.return_date,
+        passengers=raw.passengers or 1,
+        budget_inr=raw.budget_inr,
+        preferred_modes=modes,  # type: ignore[arg-type]
+        intent=raw.intent if raw.intent in VALID_INTENTS else "travel_search",
+        confidence=raw.confidence if raw.confidence is not None else 0.0,
+        raw_message=message,
+    )
 
 
 def get_llm():
-    """Build the Groq chat model, or None when no key is configured (offline fallback)."""
-    if not settings.GROQ_API_KEY:
+    """Build the chat model, or None when no key is configured (offline fallback).
+
+    Resolution order:
+      1. Generic OpenAI-compatible settings (`LLM_BASE_URL` + `LLM_MODEL` +
+         `LLM_API_KEY`) when langchain-openai is installed.
+      2. Groq — `LLM_MODEL` (what .env pins) takes precedence over `GROQ_MODEL`.
+    """
+    if settings.LLM_BASE_URL and settings.LLM_MODEL:
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError:
+            ChatOpenAI = None  # type: ignore[assignment]
+        if ChatOpenAI is not None:
+            api_key = settings.LLM_API_KEY or settings.GROQ_API_KEY
+            if not api_key:
+                return None
+            return ChatOpenAI(
+                model=settings.LLM_MODEL,
+                base_url=settings.LLM_BASE_URL,
+                api_key=api_key,
+                temperature=0,
+            )
+
+    api_key = settings.GROQ_API_KEY or settings.LLM_API_KEY
+    model = settings.LLM_MODEL or settings.GROQ_MODEL
+    if not api_key or not model:
         return None
     from langchain_groq import ChatGroq
 
-    return ChatGroq(model=settings.GROQ_MODEL, api_key=settings.GROQ_API_KEY, temperature=0)
+    return ChatGroq(model=model, api_key=api_key, temperature=0)
 
 
 def heuristic_extract(message: str) -> TravelDetails:
@@ -66,18 +146,17 @@ def extract_travel_details(message: str) -> TravelDetails:
     if llm is None:
         return heuristic_extract(message)
     try:
-        structured = llm.with_structured_output(TravelDetails)
+        # json_schema: the provider validates arguments against our schema, and
+        # (unlike function calling) the model can't invent a tool name that 400s.
+        structured = llm.with_structured_output(ClassifierFields, method="json_schema")
         result = structured.invoke([
             {"role": "system", "content": CLASSIFIER_SYSTEM},
             {"role": "user", "content": message},
         ])
-        if isinstance(result, TravelDetails):
-            result.raw_message = message
-            return result
-        details = TravelDetails.model_validate(result)
-        details.raw_message = message
-        return details
-    except Exception:  # noqa: BLE001 - LLM failure must fall back to heuristics
+        raw = result if isinstance(result, ClassifierFields) else ClassifierFields.model_validate(result)
+        return normalise(raw, message)
+    except Exception as exc:  # noqa: BLE001 - LLM failure must fall back to heuristics
+        logger.warning("Classifier LLM unavailable, using heuristics: %s", exc)
         return heuristic_extract(message)
 
 

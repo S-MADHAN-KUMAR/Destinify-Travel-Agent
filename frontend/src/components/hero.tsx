@@ -1,3 +1,4 @@
+import Link from "next/link";
 import Nav from "@/components/nav";
 import TaskCards from "@/components/task-cards";
 
@@ -40,12 +41,12 @@ export default function Hero() {
           </p>
 
           <div className="mt-6 flex flex-wrap items-center gap-3 sm:mt-8">
-            <a
-              href="#chat"
+            <Link
+              href="/chat"
               className="rounded-full bg-white px-5 py-2.5 text-[15px] font-medium text-[#202020] shadow-[0_4px_16px_rgba(2,80,130,0.28)] transition-transform duration-200 hover:-translate-y-0.5 sm:px-6 sm:py-3 sm:text-[16px]"
             >
               Plan a trip
-            </a>
+            </Link>
             <a
               href="#how"
               className="rounded-full border border-[#5cccfc] px-5 py-2.5 text-[15px] font-medium text-white transition-colors duration-200 hover:bg-[#5cccfc]/18 sm:px-6 sm:py-3 sm:text-[16px]"

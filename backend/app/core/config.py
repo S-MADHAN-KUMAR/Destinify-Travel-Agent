@@ -1,4 +1,7 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -7,11 +10,29 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Destinify API"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = "local"
-    BACKEND_CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+
+    # Browsers the Next.js dev server runs on (3000/3001). Accepts either a
+    # comma-separated string or a JSON list from the env file.
+    BACKEND_CORS_ORIGINS: Annotated[list[str], NoDecode] = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ]
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if text.startswith("["):
+            import json
+
+            return json.loads(text)
+        return [origin.strip() for origin in text.split(",") if origin.strip()]
 
     # --- LLM (Groq) ---
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
     # Generic OpenAI-compatible fallback (LLM_BASE_URL + LLM_MODEL + LLM_API_KEY)
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = ""
