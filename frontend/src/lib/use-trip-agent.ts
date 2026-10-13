@@ -2,26 +2,21 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
-import type { TravelDetails } from "@/lib/api";
-import { composeMessage, mapChatResponse } from "@/lib/agent-bridge";
 import { BRIEF, replyFor } from "@/lib/trip-chat";
 import type { Brief, Msg, Pending } from "@/lib/trip-chat";
 
 /**
- * Shared trip-agent conversation engine for both chat surfaces
- * (`/chat` full-screen and the landing-page section).
+ * Scripted trip-agent engine for the LANDING page's product-tour section.
  *
- * Send → POST /api/v1/chat → animate the reply (thinking → tools → typing).
- * If the backend is unreachable it falls back to the bundled scripted agent
- * and reports `status: "demo"`, so the UI never dead-ends.
+ * It renders a canned (but polished) conversation so the marketing page never
+ * dead-ends, and probes the backend only to show a live/demo status dot. The
+ * real, memory-aware agent lives on `/chat` (see `use-trip-planner`).
  */
 
 export type AgentStatus = "checking" | "live" | "demo";
 
 type TripAgentOptions = {
-  /** Thread to return to on reset (defaults to `seed`). */
   opening?: Msg[];
-  /** Starting trip brief (defaults to the seeded demo brief). */
   brief?: Brief;
 };
 
@@ -35,8 +30,6 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
   const [held, setHeld] = useState<string[]>([]);
   const [status, setStatus] = useState<AgentStatus>("checking");
   const idRef = useRef(0);
-  /** What the classifier knows about the trip so far (for follow-up turns). */
-  const detailsRef = useRef<TravelDetails | null>(null);
 
   const uid = () => `m${++idRef.current}`;
   const busy = pending !== null;
@@ -61,7 +54,7 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
     if (p.step === "thinking") {
       const t = setTimeout(
         () => setPending((v) => (v && v.phase === "reply" ? { ...v, step: "tools" } : v)),
-        700,
+        600,
       );
       return () => clearTimeout(t);
     }
@@ -70,7 +63,7 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
       if (p.toolIndex >= p.reply.tools.length) {
         const t = setTimeout(
           () => setPending((v) => (v && v.phase === "reply" ? { ...v, step: "answer" } : v)),
-          300,
+          250,
         );
         return () => clearTimeout(t);
       }
@@ -79,7 +72,7 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
           setPending((v) =>
             v && v.phase === "reply" ? { ...v, toolIndex: v.toolIndex + 1 } : v,
           ),
-        640,
+        520,
       );
       return () => clearTimeout(t);
     }
@@ -112,11 +105,12 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
         },
       ]);
       setPending(null);
-    }, 320);
+    }, 300);
     return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending]);
 
-  /* --- talk to the backend, fall back to the scripted agent ------- */
+  /* --- scripted reply (no backend call on the landing page) ------- */
   async function send(text: string) {
     const value = text.trim();
     if (!value || busy) return false;
@@ -124,19 +118,10 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
     setThread((prev) => [...prev, { id: uid(), role: "user", text: value }]);
     setPending({ phase: "calling" });
 
-    try {
-      const res = await api.sendChat(composeMessage(value, detailsRef.current));
-      detailsRef.current = res.details;
-      const reply = mapChatResponse(res);
-      setStatus("live");
-      if (reply.brief) setBrief((b) => ({ ...b, ...reply.brief }));
-      setPending({ phase: "reply", reply, step: "thinking", toolIndex: 0, shown: 0 });
-    } catch {
-      const reply = replyFor(value);
-      setStatus("demo");
-      if (reply.brief) setBrief((b) => ({ ...b, ...reply.brief }));
-      setPending({ phase: "reply", reply, step: "thinking", toolIndex: 0, shown: 0 });
-    }
+    const reply = replyFor(value);
+    setStatus("demo");
+    if (reply.brief) setBrief((b) => ({ ...b, ...reply.brief }));
+    setPending({ phase: "reply", reply, step: "thinking", toolIndex: 0, shown: 0 });
     return true;
   }
 
@@ -145,7 +130,6 @@ export function useTripAgent(seed: Msg[], options: TripAgentOptions = {}) {
     setPending(null);
     setBrief(startBrief);
     setHeld([]);
-    detailsRef.current = null;
   }
 
   function toggleHold(name: string) {

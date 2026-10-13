@@ -1,0 +1,319 @@
+"""Planner agent: turn real research into a day-by-day trip plan + budget + map.
+
+The LLM sequences the REAL places/restaurants/hotels the research agents found
+(it chooses by index, so nothing is hallucinated and every pin has true
+lat/lon/images). A deterministic fallback builds a solid plan when no LLM key
+is configured, so the feature never depends on the network.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from datetime import date, timedelta
+
+from pydantic import BaseModel, Field
+
+from app.agents.classifier import get_llm
+from app.agents.memory import memory_context
+from app.agents.state import (
+    BudgetBreakdown,
+    DayActivity,
+    DayMeals,
+    DayPlan,
+    GeoPoint,
+    MapPin,
+    Research,
+    TravelDetails,
+    TravelPlannerState,
+    TripPlan,
+)
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# LLM-facing itinerary schema (chooses from real, indexed lists)              #
+# --------------------------------------------------------------------------- #
+
+class DayPick(BaseModel):
+    day: int
+    theme: str = Field(default="", description="Short theme for the day, e.g. 'Old City & palaces'")
+    morning: int | None = Field(default=None, description="Index into the attractions list")
+    afternoon: int | None = Field(default=None, description="Index into the attractions list")
+    evening: int | None = Field(default=None, description="Index into the attractions list (or null)")
+    lunch: int | None = Field(default=None, description="Index into the restaurants list (or null)")
+    dinner: int | None = Field(default=None, description="Index into the restaurants list (or null)")
+    summary: str = Field(default="", description="1-2 sentence plan for the day")
+
+
+class PlannerOutput(BaseModel):
+    days: list[DayPick]
+    highlights: list[str] = Field(default_factory=list, description="3-5 trip highlights")
+    tips: list[str] = Field(default_factory=list, description="3-4 practical tips")
+
+
+PLANNER_SYSTEM = """You are an expert travel planner. Given a numbered list of REAL attractions,
+restaurants, and hotels for a destination, build a realistic day-by-day itinerary.
+
+Rules:
+- Cover each requested day (1..N). Put famous/morning-friendly sights in the morning,
+  museums/markets in the afternoon, viewpoints/dining in the evening.
+- Reference places ONLY by their integer index from the provided lists. Never invent places.
+- Choose a lunch and dinner restaurant per day from the restaurant list when available.
+- Keep each day geographically coherent when possible (don't zig-zag the city).
+- Write a short theme and a 1-2 sentence summary per day.
+- Add 3-5 highlights and 3-4 practical tips.
+- Respect the traveller's interests and pace if implied."""
+
+
+def _index_map(items: list, key: str = "name") -> dict[int, object]:
+    return {i: item for i, item in enumerate(items)}
+
+
+def build_planner_prompt(details: TravelDetails, research: Research, ctx: str) -> list[dict]:
+    att = [f"{i}. {p.name} ({p.category})" for i, p in enumerate(research.attractions)]
+    rest = [f"{i}. {r.name} ({r.cuisine})" for i, r in enumerate(research.restaurants)]
+    stay = [f"{i}. {h.name}" for i, h in enumerate(research.hotels)]
+    days = details.days or 3
+    lines = [
+        f"Destination: {details.destination}.",
+        f"Trip length: {days} days. Travellers: {details.travellers}. Pace: {details.pace}.",
+    ]
+    if details.interests:
+        lines.append(f"Interests: {', '.join(details.interests)}.")
+    if details.trip_type:
+        lines.append(f"Trip style: {details.trip_type}.")
+    if ctx:
+        lines.append(f"About the traveller:\n{ctx}")
+    lines.append("\nATTRACTIONS (index: name):")
+    lines.extend(att or ["(none)"])
+    lines.append("\nRESTAURANTS (index: name):")
+    lines.extend(rest or ["(none)"])
+    lines.append("\nSTAYS (index: name):")
+    lines.extend(stay or ["(none)"])
+    lines.append(f"\nReturn an itinerary covering days 1..{days}.")
+    return [
+        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic fallback                                                      #
+# --------------------------------------------------------------------------- #
+
+def _fallback_output(details: TravelDetails, research: Research) -> PlannerOutput:
+    days = details.days or 3
+    n_att = len(research.attractions)
+    picks: list[DayPick] = []
+    for d in range(days):
+        base = d * 3
+        morning = research.attractions[base % n_att].name if n_att else None
+        # pick by index for the LLM-less path too (indices into real lists)
+        m_idx = base % n_att if n_att else None
+        a_idx = (base + 1) % n_att if n_att else None
+        e_idx = (base + 2) % n_att if n_att else None
+        lunch = (d * 2) % len(research.restaurants) if research.restaurants else None
+        dinner = (d * 2 + 1) % len(research.restaurants) if research.restaurants else None
+        picks.append(DayPick(
+            day=d + 1,
+            theme=f"Day {d + 1} in {details.destination}",
+            morning=m_idx, afternoon=a_idx, evening=e_idx,
+            lunch=lunch, dinner=dinner,
+            summary=f"Explore {morning or details.destination} and nearby highlights at a {details.pace} pace.",
+        ))
+    return PlannerOutput(
+        days=picks,
+        highlights=[p.name for p in research.attractions[:4]],
+        tips=["Start early to beat the crowds.",
+              "Keep cash for small eateries and entry tickets.",
+              "Confirm opening hours before you go."],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Assembly: indices -> real objects, budget, map pins                         #
+# --------------------------------------------------------------------------- #
+
+_STAY_DEFAULT = {"budget": 1500.0, "mid": 3500.0, "luxury": 8000.0}
+_FOOD_PER_DAY = {"budget": 900.0, "mid": 2000.0, "luxury": 4500.0}
+
+
+def _budget_style_from(details: TravelDetails) -> str:
+    if not details.budget_inr:
+        return "mid"
+    per = details.budget_inr / max(1, details.travellers)
+    return "budget" if per < 15000 else ("mid" if per < 60000 else "luxury")
+
+
+def _build_budget(details: TravelDetails, research: Research) -> BudgetBreakdown:
+    travellers = details.travellers or 1
+    days = details.days or 3
+    nights = max(1, days - 1)
+    style = _budget_style_from(details)
+
+    transport_inr = 0.0
+    priced = [o.price_inr for o in research.transport if o.price_inr]
+    if priced:
+        transport_inr = min(priced) * travellers
+    else:
+        transport_inr = 3000.0 * travellers
+
+    hotel_nightly = next((h.price_inr for h in research.hotels if h.price_inr), None) or _STAY_DEFAULT[style]
+    rooms = math.ceil(travellers / 2)
+    stay_inr = hotel_nightly * nights * rooms
+
+    food_inr = _FOOD_PER_DAY[style] * days * travellers
+    activities_inr = 700.0 * days * travellers
+    subtotal = transport_inr + stay_inr + food_inr + activities_inr
+    misc_inr = round(subtotal * 0.1, 0)
+    total = subtotal + misc_inr
+
+    note = "Estimates in INR. Transport uses the cheapest option found."
+    if details.budget_inr and total > details.budget_inr:
+        note += f" Heads-up: this exceeds the stated budget of ₹{details.budget_inr:,.0f}."
+    return BudgetBreakdown(
+        transport_inr=round(transport_inr), stay_inr=round(stay_inr),
+        food_inr=round(food_inr), activities_inr=round(activities_inr),
+        misc_inr=round(misc_inr), total_inr=round(total), note=note)
+
+
+def _dates_for(details: TravelDetails) -> list[str | None]:
+    days = details.days or 3
+    start: date | None = None
+    if details.start_date:
+        try:
+            start = date.fromisoformat(details.start_date)
+        except ValueError:
+            start = None
+    if start is None:
+        start = date.today() + timedelta(days=7)
+    return [(start + timedelta(days=i)).isoformat() for i in range(days)]
+
+
+def assemble_trip_plan(details: TravelDetails, research: Research, plan: PlannerOutput) -> TripPlan:
+    days = details.days or max(1, len(plan.days))
+    dates = _dates_for(details)
+    attractions, restaurants, hotels = research.attractions, research.restaurants, research.hotels
+    stay_name = hotels[0].name if hotels else None
+    stay_obj = hotels[0] if hotels else None
+
+    transport_choice = None
+    if research.transport:
+        transport_choice = min(
+            [o for o in research.transport if o.price_inr] or research.transport,
+            key=lambda o: o.price_inr or 1e12)
+
+    itinerary: list[DayPlan] = []
+    pins: list[MapPin] = []
+    used: set[str] = set()
+
+    def slot_activity(pick_idx: int | None, slot: str) -> DayActivity | None:
+        if pick_idx is None or not (0 <= pick_idx < len(attractions)):
+            return None
+        p = attractions[pick_idx]
+        return DayActivity(
+            slot=slot, title=p.name, place=p.name, lat=p.lat, lon=p.lon,
+            image_url=p.image_url, description=p.description, duration_hours=2.0)
+
+    by_day = {d.day: d for d in plan.days}
+    for i in range(days):
+        dnum = i + 1
+        pick = by_day.get(dnum) or DayPick(day=dnum, theme=f"Day {dnum}")
+        acts = [a for a in (slot_activity(pick.morning, "morning"),
+                            slot_activity(pick.afternoon, "afternoon"),
+                            slot_activity(pick.evening, "evening")) if a]
+        for a in acts:
+            if a.title not in used:
+                used.add(a.title)
+                if a.lat is not None and a.lon is not None:
+                    pins.append(MapPin(lat=a.lat, lon=a.lon, label=a.title, kind="activity", day=dnum, image_url=a.image_url))
+
+        def meal(idx: int | None) -> str | None:
+            if idx is None or not (0 <= idx < len(restaurants)):
+                return None
+            r = restaurants[idx]
+            if r.lat is not None and r.lon is not None and r.name not in used:
+                pins.append(MapPin(lat=r.lat, lon=r.lon, label=r.name, kind="restaurant", day=dnum, image_url=r.image_url))
+            return r.name
+
+        meals = DayMeals(lunch=meal(pick.lunch), dinner=meal(pick.dinner))
+        summary = pick.summary or (f"Cover {', '.join(a.title for a in acts[:2])} at a {details.pace} pace." if acts else f"Explore {details.destination}.")
+        itinerary.append(DayPlan(
+            day=dnum, date=dates[i] if i < len(dates) else None,
+            theme=pick.theme or f"Day {dnum}", activities=acts, meals=meals,
+            stay=stay_name, transport=transport_choice.title if transport_choice else None,
+            summary=summary))
+
+    if stay_obj and stay_obj.lat is not None:
+        pins.append(MapPin(lat=stay_obj.lat, lon=stay_obj.lon, label=stay_obj.name, kind="hotel", image_url=stay_obj.image_url))
+
+    center = research.destination_geo
+    if not center and attractions and attractions[0].lat is not None:
+        center = GeoPoint(lat=attractions[0].lat, lon=attractions[0].lon, label=details.destination or "")
+
+    highlights = [h for h in plan.highlights if h][:5]
+    if not highlights:
+        highlights = [p.name for p in attractions[:4]]
+    tips = [t for t in plan.tips if t][:5]
+
+    return TripPlan(
+        destination=details.destination or "", origin=details.origin,
+        days=days, travellers=details.travellers,
+        route_summary=f"{details.origin or 'Departure'} → {details.destination} · {days} days · {details.travellers} traveller(s)",
+        itinerary=itinerary, attractions=attractions, restaurants=restaurants,
+        hotels=hotels, transport=research.transport, budget=_build_budget(details, research),
+        map_center=center, origin_geo=research.origin_geo, map_pins=pins,
+        highlights=highlights, tips=tips)
+
+
+def plan_itinerary(details: TravelDetails, research: Research, ctx: str) -> PlannerOutput:
+    llm = get_llm()
+    if llm is None or not research.attractions:
+        return _fallback_output(details, research)
+    try:
+        structured = llm.with_structured_output(PlannerOutput, method="json_schema")
+        raw = structured.invoke(build_planner_prompt(details, research, ctx))
+        plan = raw if isinstance(raw, PlannerOutput) else PlannerOutput.model_validate(raw)
+        if not plan.days:
+            return _fallback_output(details, research)
+        return plan
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Planner LLM unavailable, using fallback: %s", exc)
+        return _fallback_output(details, research)
+
+
+def planner_node(state: TravelPlannerState) -> dict:
+    details = state.get("details") or TravelDetails()
+    research = Research(
+        origin_geo=state.get("origin_geo"), destination_geo=state.get("destination_geo"),
+        attractions=state.get("attractions", []),
+        restaurants=state.get("restaurants", []),
+        hotels=state.get("hotels", []),
+        transport=state.get("transport_options", []),
+    )
+    from app.agents.state import LongMemory
+    from app.agents.memory import MemoryPayload
+
+    long = state.get("long_memory") or LongMemory()
+    ctx = memory_context(details, MemoryPayload(short=state.get("short_memory", []), long=long))
+    plan = plan_itinerary(details, research, ctx)
+    trip = assemble_trip_plan(details, research, plan)
+
+    lead = f"Here's your {trip.days}-day {trip.destination} plan."
+    text = _reply_text(trip)
+    return {"trip_plan": trip, "research": research, "reply_lead": lead, "reply_text": text,
+            "notes": [f"Planned {trip.days} days across {len(trip.attractions)} attractions."],
+            "errors": []}
+
+
+def _reply_text(trip: TripPlan) -> str:
+    parts = [f"I built a {trip.days}-day plan for {trip.destination} with real places, food, stays, transport and a map."]
+    if trip.itinerary:
+        first = trip.itinerary[0]
+        parts.append(f"Day 1 starts at {first.activities[0].title if first.activities else trip.destination}.")
+    if trip.highlights:
+        parts.append("Highlights: " + ", ".join(trip.highlights[:3]) + ".")
+    return " ".join(parts)

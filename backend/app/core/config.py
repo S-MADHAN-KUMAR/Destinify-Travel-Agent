@@ -50,5 +50,50 @@ class Settings(BaseSettings):
     OTD_DELHI_API: str = ""
     OTD_REALTIME_URL: str = "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb"
 
+    # --- Free geodata (no key required; the agent works fully without any of these) ---
+    # OpenStreetMap Overpass -> real attractions / restaurants / hotels by city.
+    # The main instance is often busy, so we keep a mirror failover list.
+    OVERPASS_URL: str = "https://overpass-api.de/api/interpreter"
+    OVERPASS_MIRRORS: Annotated[list[str], NoDecode] = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+        "https://overpass.openstreetmap.fr/api/interpreter",
+    ]
+
+    @field_validator("OVERPASS_MIRRORS", mode="before")
+    @classmethod
+    def parse_overpass_mirrors(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if text.startswith("["):
+            import json
+
+            return json.loads(text)
+        return [u.strip() for u in text.split(",") if u.strip()]
+    # Nominatim -> geocode a city to lat/lon for the map + route arc.
+    NOMINATIM_URL: str = "https://nominatim.openstreetmap.org/search"
+    # Polite User-Agent required by OSM/Wikimedia usage policies. Wikimedia
+    # 403s anything without a contact URL + email in the UA, so keep that shape.
+    GEO_USER_AGENT: str = "DestinifyTripAgent/1.0 (https://github.com/destinify/destinify; destinify-dev@users.noreply.github.com)"
+    # Wikipedia REST summary -> real thumbnails for famous places / eateries.
+    WIKIPEDIA_SUMMARY_URL: str = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+    WIKIMEDIA_COMMONS_SEARCH_URL: str = "https://commons.wikimedia.org/w/api.php"
+    # Openverse -> free CC image search (great for restaurants/hotels that have
+    # no Wikipedia article). No key required for basic, rate-limited use.
+    OPENVERSE_IMAGES_URL: str = "https://api.openverse.org/v1/images/"
+
+    # --- Optional rich providers (auto-upgrade: used only when a key is set) ---
+    YELP_API_KEY: str = ""          # restaurants + photos (Yelp Fusion v3)
+    AMADEUS_KEY: str = ""           # flights + hotels (Amadeus self-service, free test env)
+    AMADEUS_SECRET: str = ""
+    AMADEUS_HOST: str = "https://test.api.amadeus.com"
+
+    # How many recent turns count as short-term memory, and the in-process
+    # geodata cache TTL (seconds) so we don't hammer the free endpoints.
+    SHORT_MEMORY_TURNS: int = 12
+    GEO_CACHE_TTL_SECONDS: int = 6 * 3600
+
 
 settings = Settings()
