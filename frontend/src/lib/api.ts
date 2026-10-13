@@ -66,6 +66,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ message, session_id: sessionId, memory }),
       },
-      90_000,
+      // Research (Overpass + Wikipedia + images) plus the LLM planner can take
+      // a while on a cold cache; give it room before giving up.
+      180_000,
     ),
 };

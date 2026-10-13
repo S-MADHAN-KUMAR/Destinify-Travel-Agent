@@ -6,12 +6,10 @@ so the agent keeps context across messages and sessions.
 
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from app.agents.graph import run_chat
+from app.agents.graph import arun_chat
 from app.agents.state import MemoryPayload
 from app.core.config import settings
 
@@ -40,7 +38,9 @@ class ChatResponse(BaseModel):
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    result = await asyncio.to_thread(run_chat, req.message, req.memory, req.session_id)
+    # The graph runs async so the research fan-out (attractions/food/stay/
+    # transport) executes concurrently instead of node after node.
+    result = await arun_chat(req.message, req.memory, req.session_id)
     return ChatResponse(**result)
 
 
