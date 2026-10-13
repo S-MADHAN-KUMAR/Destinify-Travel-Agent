@@ -46,7 +46,10 @@ Return ONLY structured fields. Rules:
 - intent: trip_plan (plan an itinerary) | transport_search (compare tickets/fares) | food_search | stay_search | general.
 - confidence: 0-1.
 Null out anything the message does not state. Never invent a destination city.
-The message may open with 'Conversation so far: ... Latest message: ...': the latest message is what the user just said; conversation-so-far is context you may use to fill gaps."""
+The message may open with 'Conversation so far: ... Latest message: ...': the latest message is what the user just said; conversation-so-far is context you may use to fill gaps.
+IMPORTANT: decide `intent` from the LATEST message ONLY. A question or remark about an
+existing plan (\"best time to visit?\", \"thanks!\", \"is day 2 too packed?\") is `general`,
+never `trip_plan` — only ask for a plan when the user is actually asking you to build/change one."""
 
 
 class ClassifierFields(BaseModel):
