@@ -11,7 +11,7 @@ import logging
 
 from app.agents.state import GeoPoint, Restaurant, TravelPlannerState
 from app.agents.tools import geo, providers
-from app.agents.tools.transport import transport_options
+from app.agents.tools.transport import local_transport_options, transport_options
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,15 @@ def _destination(state: TravelPlannerState) -> str | None:
     return d.destination if d else None
 
 
-def _origin(state: TravelPlannerState) -> str:
+def _origin(state: TravelPlannerState) -> str | None:
+    """Departure city: message first, then the durable home-city memory."""
     d = state.get("details")
-    return (d.origin if d else None) or "your city"
+    if d and d.origin:
+        return d.origin
+    long = state.get("long_memory")
+    if long and long.home_city:
+        return long.home_city
+    return None
 
 
 def _to_geopoint(g: dict | None, label: str) -> GeoPoint | None:
@@ -47,7 +53,7 @@ def attractions_node(state: TravelPlannerState) -> dict:
         update: dict = {"attractions": places, "notes": notes, "errors": []}
         if destination_geo:
             update["destination_geo"] = destination_geo
-        o = state.get("details") and state["details"].origin
+        o = _origin(state)
         if o:
             og = geo.geocode(o)
             if og:
@@ -74,8 +80,13 @@ def food_node(state: TravelPlannerState) -> dict:
                 notes.append("Restaurant photos & ratings via Yelp.")
         if not restaurants:
             restaurants, notes = geo.search_restaurants(destination, limit=14)
-            for r in restaurants[:8]:
-                r.image_url = geo.food_image(r.name, r.cuisine, city_name)
+            used: set[str] = set()
+            for r in restaurants[:10]:  # photo lookups are rate-limited; cap them
+                img = geo.food_image(r.name, r.cuisine, city_name)
+                if not img or img in used:
+                    # Retry with a venue-flavoured query before falling back.
+                    img = geo.openverse_image(f"{r.name} {city_name} interior")
+                r.image_url = geo.distinct_image(img, used)
         return {"restaurants": restaurants, "notes": notes, "errors": []}
     except Exception as exc:  # noqa: BLE001
         logger.warning("food research failed: %s", exc)
@@ -108,8 +119,17 @@ def transport_node(state: TravelPlannerState) -> dict:
             image_url = p.image_url
             break
     try:
+        notes: list[str] = []
+        if not origin:
+            # No departure city yet -> getting-around options for the destination,
+            # never a fabricated fare for an unknown route.
+            return {
+                "transport_options": local_transport_options(destination, image_url),
+                "notes": ["No departure city yet — showing local transport. "
+                          "Add one (e.g. 'from Delhi') for flights and trains."],
+                "errors": [],
+            }
         opts = transport_options(origin, destination, start_date, image_url)
-        notes = []
         # Auto-upgrade: prepend real Amadeus offers when keyed.
         if settings.AMADEUS_KEY and settings.AMADEUS_SECRET:
             live = providers.amadeus_flights(origin, destination, start_date or "", image_url)

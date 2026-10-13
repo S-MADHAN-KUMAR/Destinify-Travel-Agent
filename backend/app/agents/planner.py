@@ -61,6 +61,9 @@ Rules:
 - Cover each requested day (1..N). Put famous/morning-friendly sights in the morning,
   museums/markets in the afternoon, viewpoints/dining in the evening.
 - Reference places ONLY by their integer index from the provided lists. Never invent places.
+- Prefer the famous, must-see sights. Skip minor gates, office/town-hall buildings, random
+  statues and anything a visitor would not travel for — unless the list offers nothing better.
+- Never repeat the same attraction on two different days; spread the list across the trip.
 - Choose a lunch and dinner restaurant per day from the restaurant list when available.
 - Keep each day geographically coherent when possible (don't zig-zag the city).
 - Write a short theme and a 1-2 sentence summary per day.
@@ -155,7 +158,9 @@ def _build_budget(details: TravelDetails, research: Research) -> BudgetBreakdown
     style = _budget_style_from(details)
 
     transport_inr = 0.0
-    priced = [o.price_inr for o in research.transport if o.price_inr]
+    # Intercity travel only — local getting-around fares aren't the trip's travel budget.
+    priced = [o.price_inr for o in research.transport
+              if o.price_inr and o.details.get("scope") != "local"]
     if priced:
         transport_inr = min(priced) * travellers
     else:
@@ -236,10 +241,23 @@ def assemble_trip_plan(details: TravelDetails, research: Research, plan: Planner
                 return None
             r = restaurants[idx]
             if r.lat is not None and r.lon is not None and r.name not in used:
+                used.add(r.name)
                 pins.append(MapPin(lat=r.lat, lon=r.lon, label=r.name, kind="restaurant", day=dnum, image_url=r.image_url))
             return r.name
 
-        meals = DayMeals(lunch=meal(pick.lunch), dinner=meal(pick.dinner))
+        def breakfast(i: int) -> str | None:
+            cafes = [r for r in restaurants
+                     if any(k in (r.cuisine or "").lower()
+                            for k in ("cafe", "bakery", "coffee", "breakfast", "tea"))]
+            if cafes:
+                return cafes[i % len(cafes)].name
+            if stay_name:
+                return f"Breakfast at {stay_name}"
+            if restaurants:
+                return restaurants[i % len(restaurants)].name
+            return None
+
+        meals = DayMeals(breakfast=breakfast(i), lunch=meal(pick.lunch), dinner=meal(pick.dinner))
         summary = pick.summary or (f"Cover {', '.join(a.title for a in acts[:2])} at a {details.pace} pace." if acts else f"Explore {details.destination}.")
         itinerary.append(DayPlan(
             day=dnum, date=dates[i] if i < len(dates) else None,

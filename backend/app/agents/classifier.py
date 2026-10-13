@@ -133,23 +133,71 @@ def _detect_intent(message: str, raw_intent: str | None) -> TripIntent:
     return "general"
 
 
+# --------------------------------------------------------------------------- #
+# Is this message actually asking for (re)planning, or just conversation?      #
+# --------------------------------------------------------------------------- #
+
+# Verbs that clearly mean "build or modify an itinerary".
+_STRONG_VERBS = re.compile(
+    r"\b(plan|planning|planner|itinerar\w*|organiz\w*|organis\w*|arrange\w*|build|create|"
+    r"make|draft|design|schedule|compile|put together|map out|day[- ]by[- ]day|"
+    r"add|extend|another|extra|change|modify|update|revise|redo|swap|replace|"
+    r"shorten|trim|reduce|increase|bump|compare|book\w*)\b",
+    re.IGNORECASE,
+)
+# "3 day trip", "weekend", "a week"…
+_DAYS_RE = re.compile(
+    r"\b\d+\s*-?\s*day|\bweekend\b|\ba week\b|\btwo weeks\b|\bfortnight\b", re.IGNORECASE)
+# "trip to X" / "holiday in X" — a scoped travel request, unlike a bare "visit X" question.
+_TRAVEL_SCOPE_RE = re.compile(
+    r"\b(trip|holiday|vacation|itinerary|travel|getaway|break)\s+(to|in|for|near)\b", re.IGNORECASE)
+# Signals that the user is after a NEW place, so don't backfill the last destination.
+_NEW_PLACE_RE = re.compile(
+    r"\b(somewhere else|someplace else|anywhere else|elsewhere|"
+    r"another (city|country|destination|place)|different (city|country|destination|place))\b",
+    re.IGNORECASE)
+
+
+def wants_plan(message: str, details: TravelDetails, past_destinations: list[str]) -> bool:
+    """True when the LATEST message is asking us to build or change an itinerary.
+
+    Guards against the classic failure mode: a follow-up question
+    ("what's the best time to visit?") being classified as a fresh trip plan and
+    re-running the whole planner, so every reply looks identical.
+    """
+    if _DAYS_RE.search(message) or _TRAVEL_SCOPE_RE.search(message) or _STRONG_VERBS.search(message):
+        return True
+    # A brand-new destination is an implicit "plan something for me here".
+    if details.destination and details.destination.lower() not in {p.lower() for p in past_destinations}:
+        return True
+    return False
+
+
 def heuristic_extract(message: str) -> TravelDetails:
     """Offline fallback: regex-based extraction so the graph works without an LLM key."""
     text = message.strip()
-    lower = text.lower()
+    # When the message carries a 'Conversation so far: ... Latest message: ...'
+    # wrapper, extract facts from the LATEST message only — otherwise an older
+    # "Planned 3 days in Jaipur." silently wins over "make it 5 days".
+    latest = text.split("Latest message:")[-1].strip() if "Latest message:" in text else text
+    lower = latest.lower()
     origin = destination = None
     m = re.search(
         r"from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+in|\s+with|\s*,|\s*$)",
-        text, re.IGNORECASE)
+        latest, re.IGNORECASE)
     if m:
         origin, destination = m.group(1).strip().title(), m.group(2).strip().title()
     else:
-        dm = re.search(r"(?:trip|travel|go|vacation|holiday)\s+(?:to\s+)?([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+in|\s*,|\s*$)", text, re.IGNORECASE)
+        dm = re.search(
+            r"(?:trip|travel|go|vacation|holiday)\s+(?:to\s+)?([a-zA-Z\s]+?)"
+            r"(?:\s+from\b|\s+on\b|\s+for\b|\s+in\b|\s*,|\s*$)",
+            latest, re.IGNORECASE)
         if dm:
             destination = dm.group(1).strip().title()
         # Standalone origin: "I'm from Delhi." / "from Delhi" (no "to" clause).
         if origin is None:
-            om = re.search(r"\bfrom\s+([a-zA-Z\s]+?)(?:[.,]|\s+(?:on|for|in|to|by)\b)", text, re.IGNORECASE)
+            om = re.search(r"\bfrom\s+([a-zA-Z\s]+?)(?:[.,]|\s+(?:on|for|in|to|by)\b|\s*$)",
+                           latest, re.IGNORECASE)
             if om:
                 candidate = om.group(1).strip().title()
                 if candidate.lower() not in _NON_PLACES:
@@ -174,11 +222,11 @@ def heuristic_extract(message: str) -> TravelDetails:
         days = 14
 
     start_date = None
-    dm2 = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    dm2 = re.search(r"(\d{4}-\d{2}-\d{2})", latest)
     if dm2:
         start_date = dm2.group(1)
     else:
-        dm4 = re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", text)
+        dm4 = re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", latest)
         if dm4:
             d, mo, y = int(dm4.group(1)), int(dm4.group(2)), dm4.group(3)
             year = int(y) if y and len(y) == 4 else datetime.now().year
@@ -207,7 +255,7 @@ def heuristic_extract(message: str) -> TravelDetails:
     pace = "relaxed" if "relaxed" in lower or "slow" in lower else (
         "packed" if "packed" in lower or "busy" in lower else "balanced")
 
-    intent = _detect_intent(text, None)
+    intent = _detect_intent(latest, None)
     conf = 0.7 if destination else 0.3
     return TravelDetails(
         origin=origin, destination=destination, days=days, start_date=start_date,
@@ -293,6 +341,32 @@ def classifier_node(state: TravelPlannerState) -> dict:
 
     details = extract_travel_details(full_message, long)
     details.raw_message = message
+
+    # The latest message is authoritative for concrete facts (the LLM sees the
+    # conversation too and can echo an older "3 days" over "make it 5 days").
+    facts = heuristic_extract(message)
+    if facts.days is not None:
+        details.days = facts.days
+    details.origin = details.origin or facts.origin
+    details.start_date = details.start_date or facts.start_date
+
+    # Follow-ups like "make it 5 days" or "how's the weather there?" omit the
+    # destination — reuse the one we last planned, unless they're clearly after
+    # somewhere new.
+    if _NEW_PLACE_RE.search(message):
+        details.destination = None
+    elif not details.destination and long.past_destinations:
+        details.destination = long.past_destinations[-1]
+
+    # Reconcile the LLM/heuristic intent with what the message is really asking:
+    #  - plan-shaped message + "general"  -> plan it
+    #  - question/remark about an existing plan + "trip_plan" -> talk about it
+    plan = wants_plan(message, details, long.past_destinations)
+    if plan and details.intent == "general":
+        details.intent = "trip_plan"
+    elif not plan and details.intent == "trip_plan":
+        details.intent = "general"
+
     missing = missing_fields(details)
     questions = follow_up_questions(missing, details)
     return {

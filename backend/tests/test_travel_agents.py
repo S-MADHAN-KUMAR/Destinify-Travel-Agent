@@ -257,3 +257,87 @@ def test_run_chat_uses_memory_across_turns(monkeypatch):
     mem = MemoryPayload(short=first["memory"]["short"], long=LongMemory(**first["memory"]["long"]))
     second = run_chat("Now plan a 2 day trip to Paris", mem, "m1")
     assert second["details"]["origin"] == "Delhi"  # recalled home city from memory
+
+
+def _plan_then_ask(monkeypatch, follow_up: str, session: str = "t") -> tuple[dict, dict]:
+    """Plan a 3-day Jaipur trip, then send a follow-up turn with that memory."""
+    _stub_network(monkeypatch)
+    _stub_llm(monkeypatch)
+    first = run_chat("Plan a 3 day trip to Jaipur", MemoryPayload(), session)
+    mem = MemoryPayload(short=first["memory"]["short"], long=LongMemory(**first["memory"]["long"]))
+    return first, run_chat(follow_up, mem, session)
+
+
+def test_follow_up_question_answers_instead_of_replanning(monkeypatch):
+    """The original bug: every follow-up re-ran the planner and returned the same plan."""
+    _, second = _plan_then_ask(monkeypatch, "thanks! what is the best time to visit?", "f-q")
+    assert second["trip_plan"] is None          # no re-plan
+    assert second["needs_follow_up"] is False   # no interrogation either
+    assert "Jaipur" in (second["reply_lead"] + second["reply_text"])
+
+
+def test_change_request_replans_with_memory(monkeypatch):
+    """'make it 5 days' has no destination — it must reuse the planned one."""
+    _, second = _plan_then_ask(monkeypatch, "make it 5 days", "f-days")
+    assert second["trip_plan"] is not None
+    assert second["trip_plan"]["destination"] == "Jaipur"
+    assert second["trip_plan"]["days"] == 5
+
+
+def test_new_place_request_asks_for_a_destination(monkeypatch):
+    _, second = _plan_then_ask(monkeypatch, "take me somewhere else", "f-new")
+    assert second["trip_plan"] is None
+    assert second["needs_follow_up"] is True
+
+
+def test_plan_reply_without_origin_uses_local_transport(monkeypatch):
+    _stub_network(monkeypatch)
+    _stub_llm(monkeypatch)
+    res = run_chat("Plan a 3 day trip to Jaipur", MemoryPayload(), "loc")
+    scopes = {o["details"].get("scope") for o in res["trip_plan"]["transport"]}
+    assert scopes == {"local"}                  # never a fare for an unknown route
+    # local fares must not be billed as the trip's travel budget
+    assert res["trip_plan"]["budget"]["transport_inr"] == 3000.0
+
+
+def test_plan_reply_with_origin_uses_intercity_transport(monkeypatch):
+    _stub_network(monkeypatch)
+    _stub_llm(monkeypatch)
+    res = run_chat("Plan a 3 day trip to Jaipur from Delhi", MemoryPayload(), "ic")
+    transport = res["trip_plan"]["transport"]
+    assert any(o["details"].get("scope") == "intercity" for o in transport)
+    assert res["trip_plan"]["origin"] == "Delhi"
+
+
+def test_breakfast_is_filled_for_every_day(monkeypatch):
+    _stub_network(monkeypatch)
+    _stub_llm(monkeypatch)
+    res = run_chat("Plan a 3 day trip to Jaipur", MemoryPayload(), "brk")
+    assert all(d["meals"]["breakfast"] for d in res["trip_plan"]["itinerary"])
+
+
+def test_map_pins_are_not_duplicated(monkeypatch):
+    _stub_network(monkeypatch)
+    _stub_llm(monkeypatch)
+    res = run_chat("Plan a 3 day trip to Jaipur", MemoryPayload(), "pins")
+    labels = [p["label"] for p in res["trip_plan"]["map_pins"]]
+    assert len(labels) == len(set(labels))
+
+
+# --------------------------------------------------------------------------- #
+# Data hygiene: OSM names, images                                              #
+# --------------------------------------------------------------------------- #
+
+def test_clean_name_rejects_unreadable_osm_names():
+    assert geo_mod.clean_name("Hawa   Mahal ,") == "Hawa Mahal"
+    assert geo_mod.clean_name("Maharaniyon , Jaipur") == "Maharaniyon, Jaipur"
+    assert geo_mod.clean_name("\x1f??\x1f_\x00") is None   # control chars / mojibake
+    assert geo_mod.clean_name("???") is None
+    assert geo_mod.clean_name("") is None
+
+
+def test_distinct_image_never_repeats_a_photo():
+    used: set[str] = set()
+    assert geo_mod.distinct_image("https://img/1.jpg", used) == "https://img/1.jpg"
+    assert geo_mod.distinct_image("https://img/1.jpg", used) is None
+    assert geo_mod.distinct_image(None, used) is None

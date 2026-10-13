@@ -159,9 +159,39 @@ def estimate_transport(origin: str, destination: str, distance_km: float | None,
             title=f"{mode.title()} {origin} → {destination}",
             price_inr=price, duration_min=duration, provider=rate["label"],
             image_url=image_url, source="estimate", note=note,
-            details={"distance_km": distance_km, "duration_label": _duration_label(duration)},
+            details={"scope": "intercity", "distance_km": distance_km,
+                     "duration_label": _duration_label(duration)},
         ))
     return options
+
+
+def local_transport_options(city: str, image_url: str | None) -> list[TransportOption]:
+    """Getting-around options for the destination itself.
+
+    Used when no departure city is known yet — real, distinct, city-scope prices
+    instead of invented intercity fares for an unknown route.
+    """
+    specs = [
+        ("cab", f"Auto-rickshaw & taxi (full day)", 1800.0, "Local hire (est.)",
+         "Hops between sights; agree the fare or use a meter."),
+        ("cab", f"Full-day cab with driver", 2600.0, "Local hire (est.)",
+         "Comfortable for 2-4 people covering the whole day."),
+        ("bus", "City buses & day passes", 120.0, "Public transport (est.)",
+         "Cheapest option on the main routes."),
+        ("metro", "Metro / local rail day pass", 150.0, "Local rail (est.)",
+         "Where the city has a metro or suburban rail."),
+    ]
+    note = "Local estimates. Add your departure city (e.g. 'from Delhi') to compare flights and trains."
+    return [
+        TransportOption(
+            mode=mode,  # type: ignore[arg-type]
+            title=f"{title} · {city}",
+            price_inr=price, provider=provider, image_url=image_url,
+            source="estimate", note=note,
+            details={"scope": "local", "duration_label": "per day"},
+        )
+        for mode, title, price, provider, _hint in specs
+    ]
 
 
 def transport_options(origin: str, destination: str, start_date: str | None,

@@ -1,6 +1,5 @@
 import Link from "next/link";
 import Nav from "@/components/nav";
-import TaskCards from "@/components/task-cards";
 
 export default function Hero() {
   return (
@@ -60,8 +59,6 @@ export default function Hero() {
           </p>
         </div>
       </div>
-
-      <TaskCards />
     </section>
   );
 }

@@ -12,7 +12,9 @@ instead of raising — the graph must never hard-depend on the internet.
 from __future__ import annotations
 
 import logging
+import re
 import time
+import unicodedata
 from math import cos, radians
 from typing import Any
 
@@ -53,6 +55,8 @@ def _get_json(url: str, *, params: dict | None = None, data: dict | None = None,
             resp = httpx.post(url, data=data, headers=_headers(), timeout=timeout)
         else:
             resp = httpx.get(url, params=params, headers=_headers(), timeout=timeout)
+        if resp.status_code == 404:
+            return None  # no such article/image — expected, not worth a warning
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:  # noqa: BLE001 - free endpoints flaking must not crash the agent
@@ -125,6 +129,30 @@ def _bbox(lat: float, lon: float, radius_m: int) -> str:
     return f"{lat - dlat:.5f},{lon - dlon:.5f},{lat + dlat:.5f},{lon + dlon:.5f}"
 
 
+def clean_name(raw: Any) -> str | None:
+    """Normalise an OSM name and reject unreadable/mojibake entries.
+
+    OSM carries control characters and broken encodings now and then; without
+    this a garbage name ends up as a day title, a map pin and an image query.
+    """
+    if not raw:
+        return None
+    text = unicodedata.normalize("NFKC", str(raw))
+    text = "".join(ch for ch in text if ch.isprintable())
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?)])", r"\1", text).strip(" ,.;:-|")
+    if not text or len(text) > 120:
+        return None
+    if text.count("?") > 1 or "\ufffd" in text:
+        return None  # broken encoding
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 2:
+        return None
+    if sum(c.isalnum() for c in text) / len(text) < 0.55:
+        return None  # mostly symbols -> unreadable
+    return text
+
+
 def _pois(geo: dict, kind: str, radius: int, limit: int) -> list[dict]:
     """Query Overpass for named POIs of a kind in a bbox, deduped by name.
 
@@ -149,7 +177,7 @@ def _pois(geo: dict, kind: str, radius: int, limit: int) -> list[dict]:
     out: list[dict] = []
     for el in raw:
         tags = el.get("tags", {}) or {}
-        name = tags.get("name") or tags.get("name:en")
+        name = clean_name(tags.get("name:en")) or clean_name(tags.get("name"))
         if not name or name.lower() in seen:
             continue
         pt = _element_point(el)
@@ -182,15 +210,27 @@ _OVERPASS_FILTERS: dict[str, list[tuple[str, str]]] = {
 # Wikimedia — real images                                                     #
 # --------------------------------------------------------------------------- #
 
-def wikipedia_image(title: str) -> str | None:
-    """Thumbnail from a Wikipedia summary by article title. Accurate + real."""
-    url = settings.WIKIPEDIA_SUMMARY_URL.format(title=title.replace(" ", "_"))
-    data = _get_json(url)
+def wikipedia_article(title: str) -> dict | None:
+    """Wikipedia REST summary: lead image + short extract + page URL (one call)."""
+    key = f"wiki:{title.lower().strip()}"
+    if (hit := _cached(key)) is not None:
+        return hit
+    data = _get_json(settings.WIKIPEDIA_SUMMARY_URL.format(title=title.replace(" ", "_")))
     if not data:
         return None
     thumb = (data.get("thumbnail") or {}).get("source")
     orig = (data.get("originalimage") or {}).get("source")
-    return thumb or orig
+    return _store(key, {
+        "image": thumb or orig,
+        "extract": (data.get("extract") or "").strip(),
+        "url": ((data.get("content_urls") or {}).get("desktop") or {}).get("page"),
+    })
+
+
+def wikipedia_image(title: str) -> str | None:
+    """Thumbnail from a Wikipedia summary by article title. Accurate + real."""
+    art = wikipedia_article(title)
+    return (art or {}).get("image")
 
 
 def commons_image(query: str) -> str | None:
@@ -244,6 +284,21 @@ def food_image(name: str, cuisine: str = "", city: str = "") -> str | None:
     return _store(key, img)
 
 
+def distinct_image(img: str | None, used: set[str]) -> str | None:
+    """Never show the same photo twice within one list (better a placeholder)."""
+    if not img or img in used:
+        return None
+    used.add(img)
+    return img
+
+
+def hotel_image(name: str, city: str = "") -> str | None:
+    """Prefer a real photo of the property (Openverse) over a chain logo."""
+    return (openverse_image(f"{name} hotel {city}".strip())
+            or openverse_image(f"{name} {city}".strip())
+            or image_for(name, city=city, kind="hotel"))
+
+
 # --------------------------------------------------------------------------- #
 # Ranked search entry points used by the research subagents                   #
 # --------------------------------------------------------------------------- #
@@ -262,11 +317,12 @@ def _attraction_category(tags: dict) -> str:
     return "attraction"
 
 
-def _attraction_description(tags: dict) -> str:
-    desc = tags.get("description") or tags.get("name:en") or ""
-    wiki = tags.get("wikidata")
-    bits = [b for b in [desc, ("Wikidata " + wiki) if wiki else ""] if b]
-    return " · ".join(bits)
+def clean_description(raw: Any) -> str:
+    """A short human description from OSM tags (falls back to '')."""
+    text = clean_name(raw)
+    if not text or len(text) > 400:
+        return ""
+    return text
 
 
 def _price_level(tags: dict) -> str | None:
@@ -288,24 +344,33 @@ def search_attractions(city: str, limit: int = 18) -> tuple[list[Place], list[st
         notes.append(f"No OpenStreetMap attractions found near {geo.get('city', city)}.")
         return [], notes
 
-    def rank(p: dict) -> int:
-        return _ATTRACTION_RANK.get(_attraction_category(p["tags"]), 20)
+    def rank(p: dict) -> tuple[int, int]:
+        # (notability, category) — a Wikidata/Wikipedia-linked POI is almost
+        # always the "famous" version of a sight, not a minor local gate.
+        notable = 0 if (p["tags"].get("wikidata") or p["tags"].get("wikipedia")) else 1
+        return notable, _ATTRACTION_RANK.get(_attraction_category(p["tags"]), 20)
 
     pois.sort(key=rank)
     pois = pois[:limit]
     city_name = geo.get("city", city)
     places: list[Place] = []
+    used_images: set[str] = set()
     for p in pois:
         tags = p["tags"]
         category = _attraction_category(tags)
+        article = wikipedia_article(p["name"]) or {}
+        img = article.get("image") or (openverse_image(f"{p['name']} {city_name}") or "").strip() \
+            or commons_image(f"{p['name']} {city_name}")
+        wiki_url = article.get("url") or (
+            f"https://www.wikidata.org/wiki/{tags['wikidata']}" if tags.get("wikidata") else None)
         places.append(Place(
             name=p["name"], category=category, lat=p["lat"], lon=p["lon"],
-            image_url=image_for(p["name"], city=city_name, kind="attraction"),
-            description=_attraction_description(tags),
+            image_url=distinct_image(img, used_images),
+            description=clean_description(tags.get("description")) or article.get("extract", ""),
             price_level=_price_level(tags),
             opening_hours=tags.get("opening_hours"),
-            wiki_url=tags.get("wikidata") and f"https://www.wikidata.org/wiki/{tags['wikidata']}",
-            source="osm",
+            wiki_url=wiki_url,
+            source="osm" if not article.get("extract") else "wikipedia",
         ))
     return places, notes
 
@@ -368,16 +433,17 @@ def search_hotels(city: str, limit: int = 16) -> tuple[list[Hotel], list[str]]:
     pois = pois[:limit]
     city_name = geo.get("city", city)
     hotels: list[Hotel] = []
+    used_images: set[str] = set()
     for p in pois:
         tags = p["tags"]
         stars = tags.get("stars")
-        desc_bits = [tags.get("description") or ""]
+        desc_bits = [clean_description(tags.get("description") or "")]
         if stars:
             desc_bits.append(f"{stars}★")
         wifi = tags.get("internet_access") in ("yes", "wlan")
         hotels.append(Hotel(
             name=p["name"], lat=p["lat"], lon=p["lon"],
-            image_url=image_for(p["name"], city=city_name, kind="hotel"),
+            image_url=distinct_image(hotel_image(p["name"], city_name), used_images),
             rating=float(stars) if stars and str(stars).replace(".", "").isdigit() else None,
             description=" · ".join(b for b in desc_bits if b),
             amenities=(["Wi-Fi"] if wifi else []) + ([tags["stars"] + "★"] if stars else []),

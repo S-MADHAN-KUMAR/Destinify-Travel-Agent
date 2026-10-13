@@ -1,22 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import dynamic from "next/dynamic";
 
 import { AgentMark, AgentNotes, Dots, ToolRow } from "@/components/chat-ui";
+import PixelGlobe from "@/components/pixel-globe";
 import { TripBoard } from "@/components/trip-board";
 import { useTripPlanner } from "@/lib/use-trip-planner";
 import type { PlanMsg } from "@/lib/use-trip-planner";
-
-/* The 3D globe is client-only; preload it in the welcome panel too. */
-const Globe3D = dynamic(() => import("@/components/globe-3d"), {
-  ssr: false,
-  loading: () => (
-    <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#0c2440] to-[#1c6cb4] text-[12px] text-white/60">
-      Loading globe…
-    </div>
-  ),
-});
 
 const STATUS = {
   checking: { dot: "bg-[#c9cfc7]", label: "Connecting to agent…" },
@@ -241,11 +231,11 @@ export function ChatApp() {
             <TripBoard plan={tripPlan} />
           ) : (
             <div className="flex h-full flex-col">
-              <div className="relative h-64 overflow-hidden rounded-[18px] border border-line-card bg-gradient-to-br from-[#0c2440] via-[#10324f] to-[#1c6cb4]">
-                <Globe3D />
+              <div className="relative h-64 overflow-hidden rounded-[18px] border border-line-card bg-[#06070a]">
+                <PixelGlobe />
                 <div className="pointer-events-none absolute bottom-4 left-4 text-white">
                   <p className="font-mono text-[10.5px] tracking-[1.2px] text-white/60 uppercase">Explore anywhere</p>
-                  <p className="mt-1 text-[18px] font-medium">Spin the globe · pick a place</p>
+                  <p className="mt-1 text-[18px] font-medium">Pixel planet · pick a place</p>
                 </div>
               </div>
               <div className="mt-5 rounded-[18px] border border-line-card bg-white p-5">

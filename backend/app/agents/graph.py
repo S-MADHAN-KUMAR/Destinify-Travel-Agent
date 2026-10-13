@@ -2,6 +2,7 @@
 
     START -> memory_loader -> classifier
         -> (needs follow-up?) ask -> memory_saver -> END
+        -> (conversational turn?) chat -> memory_saver -> END
         -> supervisor -> [attractions / food / stay / transport] (parallel fan-out)
         -> planner -> memory_saver -> END
 
@@ -15,6 +16,7 @@ import logging
 
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.chat import chat_node
 from app.agents.classifier import classifier_node
 from app.agents.memory import (
     append_turn,
@@ -64,6 +66,7 @@ def memory_saver(state: TravelPlannerState) -> dict:
     summary = state.get("reply_text") or (f"Discussed a trip to {details.destination}." if details else "General chat.")
     if trip:
         summary = f"Planned {trip.days} days in {trip.destination}."
+    summary = " ".join(summary.split())[:180]  # keep short-term memory compact
     short = append_turn(state.get("short_memory", []), state.get("user_message", ""), summary)
     payload = MemoryPayload(short=short, long=long)
     save_memory(session_id, payload)
@@ -91,7 +94,12 @@ def _guarded(capability: str):
 
 
 def _route_after_classifier(state: TravelPlannerState) -> str:
-    return "ask" if state.get("needs_follow_up") else "supervisor"
+    if state.get("needs_follow_up"):
+        return "ask"
+    details = state.get("details")
+    if details is not None and details.intent == "general":
+        return "chat"  # conversational turn: answer from memory, don't re-plan
+    return "supervisor"
 
 
 def build_graph():
@@ -99,6 +107,7 @@ def build_graph():
     graph.add_node("memory_loader", memory_loader)
     graph.add_node("classifier", classifier_node)
     graph.add_node("ask", ask_node)
+    graph.add_node("chat", chat_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("planner", planner_node)
     graph.add_node("memory_saver", memory_saver)
@@ -109,8 +118,9 @@ def build_graph():
     graph.add_edge("memory_loader", "classifier")
     graph.add_conditional_edges(
         "classifier", _route_after_classifier,
-        {"ask": "ask", "supervisor": "supervisor"})
+        {"ask": "ask", "chat": "chat", "supervisor": "supervisor"})
     graph.add_edge("ask", "memory_saver")
+    graph.add_edge("chat", "memory_saver")
 
     # Fan-out/fan-in: supervisor -> capability nodes -> planner (the planner is
     # the join point, so it waits for every selected research node to finish).
