@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
-import { getSessionId, loadMemory, saveMemory } from "@/lib/memory";
+import { getSessionId, loadMemory, loadPlan, saveMemory, savePlan } from "@/lib/memory";
 import { EMPTY_LONG_MEMORY } from "@/lib/trip-types";
 import type { MemoryPayload, ToolTrace, TripPlan } from "@/lib/trip-types";
 
@@ -50,6 +50,7 @@ export function useTripPlanner() {
   useEffect(() => {
     sessionRef.current = getSessionId();
     setMemory(loadMemory());
+    setTripPlan(loadPlan()); // restore the board after a reload
     hydrated.current = true;
     let alive = true;
     api
@@ -74,7 +75,10 @@ export function useTripPlanner() {
         setStatus("live");
         setMemory(res.memory);
         saveMemory(res.memory); // persist long + short term memory
-        if (res.trip_plan) setTripPlan(res.trip_plan);
+        if (res.trip_plan) {
+          setTripPlan(res.trip_plan);
+          savePlan(res.trip_plan);
+        }
         setMessages((prev) => [
           ...prev,
           {
@@ -116,6 +120,7 @@ export function useTripPlanner() {
   const newTrip = useCallback(() => {
     setMessages([]);
     setTripPlan(null);
+    savePlan(null);
   }, []);
 
   return { messages, tripPlan, memory, status, sending, send, newTrip };

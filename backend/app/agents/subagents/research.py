@@ -80,9 +80,11 @@ def food_node(state: TravelPlannerState) -> dict:
                 notes.append("Restaurant photos & ratings via Yelp.")
         if not restaurants:
             restaurants, notes = geo.search_restaurants(destination, limit=14)
+            capped = restaurants[:10]  # photo lookups are rate-limited; cap them
+            images = geo.parallel(
+                lambda r: geo.food_image(r.name, r.cuisine, city_name), capped)
             used: set[str] = set()
-            for r in restaurants[:10]:  # photo lookups are rate-limited; cap them
-                img = geo.food_image(r.name, r.cuisine, city_name)
+            for r, img in zip(capped, images):
                 if not img or img in used:
                     # Retry with a venue-flavoured query before falling back.
                     img = geo.openverse_image(f"{r.name} {city_name} interior")

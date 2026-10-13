@@ -15,6 +15,7 @@ import logging
 import re
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from math import cos, radians
 from typing import Any
 
@@ -29,6 +30,17 @@ _TIMEOUT = 25.0
 # Simple in-process TTL cache so repeated asks for the same city don't hammer
 # the free endpoints (they rate-limit aggressively).
 _CACHE: dict[str, tuple[float, Any]] = {}
+
+# Image lookups are 1-3 HTTP calls *per place*; doing them serially made a
+# single city cost 100s+. Resolve them concurrently instead.
+_IMG_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="geo-img")
+
+
+def parallel(fn, items: list) -> list:
+    """Map `fn` over `items` concurrently (empty input -> empty output)."""
+    if not items:
+        return []
+    return list(_IMG_POOL.map(fn, items))
 
 
 def _cached(key: str):
@@ -103,7 +115,7 @@ def _overpass(query: str) -> list[dict]:
     """POST an Overpass QL query with mirror failover. Returns elements (or [])."""
     for url in settings.OVERPASS_MIRRORS or [settings.OVERPASS_URL]:
         try:
-            resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=30.0)
+            resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=18.0)
             if resp.status_code != 200:
                 continue
             data = resp.json()
@@ -296,7 +308,17 @@ def hotel_image(name: str, city: str = "") -> str | None:
     """Prefer a real photo of the property (Openverse) over a chain logo."""
     return (openverse_image(f"{name} hotel {city}".strip())
             or openverse_image(f"{name} {city}".strip())
-            or image_for(name, city=city, kind="hotel"))
+            or wikipedia_image(name))
+
+
+def place_media(name: str, city: str) -> dict:
+    """Lead image + short extract for a sight (Wikipedia first, then CC search)."""
+    article = wikipedia_article(name) or {}
+    img = article.get("image")
+    if not img:
+        img = ((openverse_image(f"{name} {city}") or "").strip()
+               or commons_image(f"{name} {city}"))
+    return {"image": img or None, "extract": article.get("extract", ""), "url": article.get("url")}
 
 
 # --------------------------------------------------------------------------- #
@@ -353,24 +375,22 @@ def search_attractions(city: str, limit: int = 18) -> tuple[list[Place], list[st
     pois.sort(key=rank)
     pois = pois[:limit]
     city_name = geo.get("city", city)
+    # Lead images + Wikipedia extracts resolve concurrently (they used to be
+    # the single slowest step in the whole graph).
+    media = parallel(lambda p: place_media(p["name"], city_name), pois)
     places: list[Place] = []
     used_images: set[str] = set()
-    for p in pois:
+    for p, m in zip(pois, media):
         tags = p["tags"]
-        category = _attraction_category(tags)
-        article = wikipedia_article(p["name"]) or {}
-        img = article.get("image") or (openverse_image(f"{p['name']} {city_name}") or "").strip() \
-            or commons_image(f"{p['name']} {city_name}")
-        wiki_url = article.get("url") or (
-            f"https://www.wikidata.org/wiki/{tags['wikidata']}" if tags.get("wikidata") else None)
         places.append(Place(
-            name=p["name"], category=category, lat=p["lat"], lon=p["lon"],
-            image_url=distinct_image(img, used_images),
-            description=clean_description(tags.get("description")) or article.get("extract", ""),
+            name=p["name"], category=_attraction_category(tags), lat=p["lat"], lon=p["lon"],
+            image_url=distinct_image(m.get("image"), used_images),
+            description=clean_description(tags.get("description")) or m.get("extract", ""),
             price_level=_price_level(tags),
             opening_hours=tags.get("opening_hours"),
-            wiki_url=wiki_url,
-            source="osm" if not article.get("extract") else "wikipedia",
+            wiki_url=m.get("url") or (
+                f"https://www.wikidata.org/wiki/{tags['wikidata']}" if tags.get("wikidata") else None),
+            source="wikipedia" if m.get("extract") else "osm",
         ))
     return places, notes
 
@@ -432,9 +452,10 @@ def search_hotels(city: str, limit: int = 16) -> tuple[list[Hotel], list[str]]:
     pois.sort(key=rank)
     pois = pois[:limit]
     city_name = geo.get("city", city)
+    images = parallel(lambda p: hotel_image(p["name"], city_name), pois)
     hotels: list[Hotel] = []
     used_images: set[str] = set()
-    for p in pois:
+    for p, img in zip(pois, images):
         tags = p["tags"]
         stars = tags.get("stars")
         desc_bits = [clean_description(tags.get("description") or "")]
@@ -443,7 +464,7 @@ def search_hotels(city: str, limit: int = 16) -> tuple[list[Hotel], list[str]]:
         wifi = tags.get("internet_access") in ("yes", "wlan")
         hotels.append(Hotel(
             name=p["name"], lat=p["lat"], lon=p["lon"],
-            image_url=distinct_image(hotel_image(p["name"], city_name), used_images),
+            image_url=distinct_image(img, used_images),
             rating=float(stars) if stars and str(stars).replace(".", "").isdigit() else None,
             description=" · ".join(b for b in desc_bits if b),
             amenities=(["Wi-Fi"] if wifi else []) + ([tags["stars"] + "★"] if stars else []),

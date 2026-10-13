@@ -1,8 +1,10 @@
 # Destinify Frontend (Next.js)
 
 The user-facing half of Destinify: a landing page with an animated hero and an
-embedded trip chat, plus a full-screen `/chat` conversation with the FastAPI
-backend.
+embedded scripted product tour, plus the production trip planner at `/chat` —
+a two-pane surface with the agent conversation on the left and a live trip
+board (3D globe, city map, day-by-day plan, food, stays, transport, budget) on
+the right.
 
 ## Prerequisites
 
@@ -13,69 +15,79 @@ cd backend
 uv run uvicorn app.main:app --port 8000
 ```
 
-If the backend is down the UI still works — it falls back to a scripted demo
-agent and the status strip shows **Demo mode · backend offline**. With the
-backend up, the strip shows **Live · connected to the trip API**.
+The landing page is fully scripted and works without the backend. On `/chat` the
+status strip shows **Live · trip engine connected** when the API answers and
+**Offline · start the backend to plan** when it doesn't — messages and memory are
+kept locally either way.
 
 ## Run
 
 ```powershell
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) (or `/chat` for the
-full-screen agent).
+Open [http://localhost:3000](http://localhost:3000) or go straight to
+[/chat](http://localhost:3000/chat).
 
 ### Environment
 
 ```bash
-# frontend/.env.local (optional — this is the default)
+# frontend/.env (optional — this is the default)
 NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
 
 Set `NEXT_PUBLIC_API_URL` when the backend isn't on `localhost:8000`. It is a
 `NEXT_PUBLIC_` variable, so it is read at **build** time — bake it in when you
-run `npm run build`.
+run `pnpm build`.
 
 ## Routes
 
-| Route   | What it is                                                        |
-| ------- | ----------------------------------------------------------------- |
-| `/`     | Landing page: hero (GIF background), features, embedded trip chat  |
-| `/chat` | Full-screen conversation — navbar, chat, footer below the fold    |
+| Route   | What it is                                                             |
+| ------- | ---------------------------------------------------------------------- |
+| `/`     | Landing page: hero (GIF background), scripted trip-chat tour, features  |
+| `/chat` | Production planner: conversation pane + trip board (globe/map/itinerary) |
 
-## How the chat works
+## How the planner works
 
 ```
 src/
   app/chat/page.tsx        route shell: Nav + ChatApp + Footer
   components/
-    chat-app.tsx           full-screen surface for /chat
-    trip-chat.tsx          embedded chat section on the landing page
-    chat-ui.tsx            shared pieces: AgentMark, ToolRow, MessageCard,
-                           TravelRows, AgentNotes
+    chat-app.tsx           two-pane planner surface for /chat
+    trip-board.tsx         all-in-one trip view: tabs + budget + globe + map
+    globe-3d.tsx           react-three-fiber globe with the route arc
+    city-map.tsx           Leaflet map with day pins + fly-to
+    smart-image.tsx        resilient <img> with graceful fallback
+    trip-chat.tsx          embedded scripted chat on the landing page
+    chat-ui.tsx            shared pieces: AgentMark, ToolRow, AgentNotes
   lib/
-    use-trip-agent.ts      conversation engine both surfaces share
+    use-trip-planner.ts    production conversation engine (memory-aware)
+    use-trip-agent.ts      self-contained scripted engine for the landing tour
     api.ts                 typed backend client (health / chatConfig / sendChat)
-    agent-bridge.ts        composes the outbound message, maps the response
+    memory.ts              localStorage long/short-term memory + session id
+    trip-types.ts          frontend contract mirroring the backend models
     trip-chat.ts           shared types, briefs, scripted offline fallback
 ```
 
-- The backend is **stateless** (`POST /api/v1/chat` takes a single `message`),
-  so `composeMessage()` labels the user's newest line as `Latest message:` and
-  repeats what the classifier already extracted as `Trip context:`. Follow-ups
-  like "make it 3 travellers" resolve against the trip instead of arriving bare.
-- `mapChatResponse()` turns the response into the UI: follow-up questions, the
-  priced options card, brief pills, and collapsed notes/errors under
-  **How I got this**.
+- **Memory round-trip.** Every `POST /api/v1/chat` sends
+  `{message, session_id, memory}`; the response returns the updated memory,
+  which is written straight back to `localStorage`. The agent therefore keeps
+  context across messages *and* reloads — long-term profile (home city,
+  interests, past destinations) plus the rolling short-term thread.
+- **One board, many asks.** A plan response replaces the trip board; a
+  conversational answer (a question about the plan) leaves the board untouched,
+  so follow-ups never wipe a plan you are still reading.
+- **Free-first images.** Photos come from OpenStreetMap/Wikipedia/Openverse via
+  `SmartImage`, which falls back to a styled placeholder if a host blocks a
+  request — no `next/image` allowlist fragility.
 
 ## Checks
 
 ```powershell
 npx tsc --noEmit     # types
 npx eslint src       # lint
-npm run build        # production build
+pnpm build           # production build
 ```
 
 ## Learn More

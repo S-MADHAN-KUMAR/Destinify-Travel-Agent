@@ -141,16 +141,31 @@ def _dump(obj):
 
 def run_chat(message: str, memory: MemoryPayload | None = None,
              session_id: str = "default") -> dict:
-    """Run the graph for one user turn. Returns reply + plan + updated memory."""
+    """Run the graph for one user turn (sync). Returns reply + plan + memory."""
+    result = app_graph.invoke(_initial_state(message, memory, session_id))
+    return _respond(result)
+
+
+async def arun_chat(message: str, memory: MemoryPayload | None = None,
+                    session_id: str = "default") -> dict:
+    """Async variant — the API uses this so the research fan-out runs in
+    parallel (attractions/food/stay/transport) instead of one after another."""
+    result = await app_graph.ainvoke(_initial_state(message, memory, session_id))
+    return _respond(result)
+
+
+def _initial_state(message: str, memory: MemoryPayload | None,
+                   session_id: str) -> TravelPlannerState:
     memory = memory or MemoryPayload()
-    initial: TravelPlannerState = {
+    return {
         "session_id": session_id,
         "user_message": message,
         "short_memory": memory.short,
         "long_memory": memory.long,
     }
-    result = app_graph.invoke(initial)
 
+
+def _respond(result: dict) -> dict:
     details = result.get("details")
     trip = result.get("trip_plan")
     updated_memory = MemoryPayload(

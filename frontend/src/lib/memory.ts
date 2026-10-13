@@ -10,13 +10,18 @@
  * The backend treats this payload as the source of truth and returns the
  * updated version each turn; we write it straight back. A stable `sessionId`
  * gives the server a memory fallback even if the client payload is cleared.
+ *
+ * The last TripPlan is persisted too, so a reload restores the trip board
+ * instead of showing an empty right-hand pane next to memory that says a trip
+ * was already planned.
  */
 
 import { EMPTY_LONG_MEMORY } from "@/lib/trip-types";
-import type { LongMemory, MemoryPayload, ShortTurn } from "@/lib/trip-types";
+import type { LongMemory, MemoryPayload, ShortTurn, TripPlan } from "@/lib/trip-types";
 
 const MEM_KEY = "destinify.memory.v1";
 const SESSION_KEY = "destinify.session.v1";
+const PLAN_KEY = "destinify.plan.v1";
 const MAX_SHORT = 24; // keep localStorage bounded
 
 function safeParse<T>(raw: string | null, fallback: T): T {
@@ -74,5 +79,28 @@ export function clearMemory(): void {
     window.localStorage.removeItem(MEM_KEY);
   } catch {
     /* ignore */
+  }
+}
+
+/** Last TripPlan, so a reload doesn't empty the trip board. */
+export function loadPlan(): TripPlan | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return safeParse<TripPlan | null>(window.localStorage.getItem(PLAN_KEY), null);
+  } catch {
+    return null;
+  }
+}
+
+export function savePlan(plan: TripPlan | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (plan) {
+      window.localStorage.setItem(PLAN_KEY, JSON.stringify(plan));
+    } else {
+      window.localStorage.removeItem(PLAN_KEY);
+    }
+  } catch {
+    /* storage full / private mode — the board just won't survive a reload */
   }
 }
