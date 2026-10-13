@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
@@ -94,8 +94,12 @@ function PinDots({ points }: { points: { lat: number; lon: number }[] }) {
   );
 }
 
-function Spin({ children }: { children: React.ReactNode }) {
+function Spin({ aim = 0, children }: { aim?: number; children: React.ReactNode }) {
   const ref = useRef<THREE.Group>(null);
+  // Start facing the destination instead of showing the far side of the earth.
+  useEffect(() => {
+    if (ref.current) ref.current.rotation.y = aim;
+  }, [aim]);
   useFrame((_, delta) => {
     if (ref.current) ref.current.rotation.y += delta * 0.08;
   });
@@ -103,11 +107,19 @@ function Spin({ children }: { children: React.ReactNode }) {
 }
 
 function Scene({ origin, destination, pins }: { origin?: Pt; destination?: Pt; pins: { lat: number; lon: number }[] }) {
+  // Rotation that brings the destination (or first pin) to the camera-facing side.
+  const aim = useMemo(() => {
+    const target = destination ?? (pins[0] ? { lat: pins[0].lat, lon: pins[0].lon } : null);
+    if (!target) return 0;
+    const v = latLonToVector3(target.lat, target.lon, R);
+    return Math.atan2(-v.x, v.z);
+  }, [destination, pins]);
+
   return (
     <>
       <ambientLight intensity={1.1} />
       <directionalLight position={[5, 3, 5]} intensity={0.8} />
-      <Spin>
+      <Spin aim={aim}>
         {/* earth */}
         <mesh>
           <sphereGeometry args={[R, 64, 64]} />

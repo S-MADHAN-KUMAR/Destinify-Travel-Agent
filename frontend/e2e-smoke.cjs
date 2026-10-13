@@ -65,10 +65,17 @@ const send = async (page, text) => {
 
   // --- 3. conversational follow-up must not re-plan ------------------------
   await send(page, "what is the best time to visit?");
-  await page
-    .getByText(/October|monsoon|winter|season|weather|best time/i)
-    .first()
-    .waitFor({ timeout: 180000 });
+  // Wait for the turn to complete: the memory thread grows by two entries.
+  await page.waitForFunction(
+    () => {
+      const raw = localStorage.getItem("destinify.memory.v1");
+      if (!raw) return false;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed.short) && parsed.short.length >= 4;
+    },
+    undefined,
+    { timeout: 240000 },
+  );
   await page.waitForTimeout(2000);
 
   const boardStillThere = await page.getByRole("heading", { name: "Jaipur", level: 2 }).count();

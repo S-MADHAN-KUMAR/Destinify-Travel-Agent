@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from math import asin, cos, radians, sin, sqrt
 
 import httpx
@@ -21,6 +22,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 TIMEOUT = 20.0
+
+# While set, all RapidAPI calls short-circuit (key rejected / rate-limited).
+_RAPID_COOLING_UNTIL = 0.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -52,18 +56,32 @@ def _duration_label(mins: int | None) -> str | None:
 def _rapid(host: str, path: str, params: dict) -> dict | None:
     if not settings.RAPID_API_KEY:
         return None
+    # A rejected/expired key returns 401/403 and 429s are rate limits: stop
+    # hammering the host for a while instead of paying the latency each turn.
+    if time.time() < _RAPID_COOLING_UNTIL:
+        return None
     try:
         resp = httpx.get(
             f"https://{host}{path}",
             headers={"x-rapidapi-key": settings.RAPID_API_KEY, "x-rapidapi-host": host},
             params=params, timeout=TIMEOUT,
         )
+        if resp.status_code in (401, 403, 429):
+            logger.warning("rapidapi rejected (%s%s): HTTP %s — cooling down 15 min",
+                           host, path, resp.status_code)
+            _set_rapid_cooldown()
+            return None
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, dict) else {"data": data}
     except Exception as exc:  # noqa: BLE001
         logger.warning("rapidapi call failed (%s%s): %s", host, path, exc)
         return None
+
+
+def _set_rapid_cooldown(minutes: int = 15) -> None:
+    global _RAPID_COOLING_UNTIL
+    _RAPID_COOLING_UNTIL = time.time() + minutes * 60
 
 
 def _resolve_airport(query: str) -> dict | None:

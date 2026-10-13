@@ -280,7 +280,10 @@ def assemble_trip_plan(details: TravelDetails, research: Research, plan: Planner
     return TripPlan(
         destination=details.destination or "", origin=details.origin,
         days=days, travellers=details.travellers,
-        route_summary=f"{details.origin or 'Departure'} → {details.destination} · {days} days · {details.travellers} traveller(s)",
+        route_summary=(
+            f"{details.origin} → {details.destination} · {days} days · {details.travellers} traveller(s)"
+            if details.origin else
+            f"{details.destination} · {days} days · {details.travellers} traveller(s)"),
         itinerary=itinerary, attractions=attractions, restaurants=restaurants,
         hotels=hotels, transport=research.transport, budget=_build_budget(details, research),
         map_center=center, origin_geo=research.origin_geo, map_pins=pins,
