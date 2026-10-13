@@ -15,7 +15,7 @@ import logging
 import re
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import cos, radians
 from typing import Any
 
@@ -111,18 +111,46 @@ def _extract_city(address: dict) -> str | None:
 # Overpass — real POIs from OpenStreetMap                                     #
 # --------------------------------------------------------------------------- #
 
+def _overpass_fetch(url: str, query: str) -> list[dict]:
+    """One Overpass request. Returns [] on any failure (status, timeout, parse)."""
+    try:
+        resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=18.0)
+        if resp.status_code != 200:
+            logger.debug("overpass %s -> HTTP %s", url, resp.status_code)
+            return []
+        data = resp.json()
+        if isinstance(data, dict) and "elements" in data:
+            return data["elements"]
+    except Exception as exc:  # noqa: BLE001 - try the next mirror
+        logger.warning("overpass mirror failed (%s): %s", url, exc)
+    return []
+
+
 def _overpass(query: str) -> list[dict]:
-    """POST an Overpass QL query with mirror failover. Returns elements (or [])."""
-    for url in settings.OVERPASS_MIRRORS or [settings.OVERPASS_URL]:
-        try:
-            resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=18.0)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            if isinstance(data, dict) and "elements" in data:
-                return data["elements"]
-        except Exception as exc:  # noqa: BLE001 - try the next mirror
-            logger.warning("overpass mirror failed (%s): %s", url, exc)
+    """POST an Overpass QL query with mirror failover. Returns elements (or []).
+
+    The first two mirrors are raced concurrently and the first good answer wins
+    — the public instances are individually flaky, and waiting for one timeout
+    after another made a single city query take a minute.
+    """
+    mirrors = list(settings.OVERPASS_MIRRORS or [settings.OVERPASS_URL])
+    head, tail = mirrors[:2], mirrors[2:]
+    if len(head) > 1:
+        with ThreadPoolExecutor(max_workers=len(head), thread_name_prefix="overpass") as pool:
+            futures = [pool.submit(_overpass_fetch, url, query) for url in head]
+            for fut in as_completed(futures):
+                elements = fut.result()
+                if elements:
+                    for pending in futures:
+                        pending.cancel()
+                    return elements
+    else:
+        for url in head:
+            if elements := _overpass_fetch(url, query):
+                return elements
+    for url in tail:  # fall back to the remaining mirrors one at a time
+        if elements := _overpass_fetch(url, query):
+            return elements
     return []
 
 

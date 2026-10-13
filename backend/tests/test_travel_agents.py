@@ -83,6 +83,8 @@ def _stub_network(monkeypatch, cities=("Jaipur", "Delhi")):
                         lambda city, limit=14: (_restaurants(city), []))
     monkeypatch.setattr(geo_mod, "search_hotels", lambda city, limit=12: (_hotels(city), []))
     monkeypatch.setattr(geo_mod, "food_image", lambda *a, **k: "https://food.example/x.jpg")
+    monkeypatch.setattr(geo_mod, "openverse_image", lambda *a, **k: None)  # image retry path
+    monkeypatch.setattr(geo_mod, "wikipedia_article", lambda *a, **k: None)
     # transport module imports geocode directly and calls live search
     monkeypatch.setattr("app.agents.tools.transport.geocode", _fake_geocode)
     monkeypatch.setattr("app.agents.tools.transport.live_flight_options", lambda *a, **k: [])
@@ -188,9 +190,12 @@ def test_estimate_transport_is_distance_based():
     assert all(p and p > 0 for p in prices.values())
 
 
-def test_route_distance_differs_by_city():
+def test_route_distance_differs_by_city(monkeypatch):
+    monkeypatch.setattr("app.agents.tools.transport.geocode", _fake_geocode)
     d1 = transport_mod.route_distance_km("Delhi", "Jaipur")
-    assert d1 is not None  # geocode stubbed
+    d2 = transport_mod.route_distance_km("Delhi", "Paris")
+    assert d1 is not None and d2 is not None
+    assert d2 > d1  # Paris is much further from Delhi than Jaipur is
 
 
 # --------------------------------------------------------------------------- #

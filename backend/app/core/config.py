@@ -55,10 +55,10 @@ class Settings(BaseSettings):
     # The main instance is often busy, so we keep a mirror failover list.
     OVERPASS_URL: str = "https://overpass-api.de/api/interpreter"
     OVERPASS_MIRRORS: Annotated[list[str], NoDecode] = [
+        "https://overpass.openstreetmap.fr/api/interpreter",
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-        "https://overpass.openstreetmap.fr/api/interpreter",
     ]
 
     @field_validator("OVERPASS_MIRRORS", mode="before")
