@@ -57,8 +57,6 @@ class Settings(BaseSettings):
     OVERPASS_MIRRORS: Annotated[list[str], NoDecode] = [
         "https://overpass.openstreetmap.fr/api/interpreter",
         "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     ]
 
     @field_validator("OVERPASS_MIRRORS", mode="before")

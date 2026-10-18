@@ -26,7 +26,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 25.0
+_TIMEOUT = 10.0
+_IMAGE_TIMEOUT = 3.0
+_OPENVERSE_DISABLED_UNTIL = 0.0
+
 # Simple in-process TTL cache so repeated asks for the same city don't hammer
 # the free endpoints (they rate-limit aggressively).
 _CACHE: dict[str, tuple[float, Any]] = {}
@@ -114,7 +117,7 @@ def _extract_city(address: dict) -> str | None:
 def _overpass_fetch(url: str, query: str) -> list[dict]:
     """One Overpass request. Returns [] on any failure (status, timeout, parse)."""
     try:
-        resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=18.0)
+        resp = httpx.post(url, data={"data": query}, headers=_headers(), timeout=8.0)
         if resp.status_code != 200:
             logger.debug("overpass %s -> HTTP %s", url, resp.status_code)
             return []
@@ -291,9 +294,15 @@ def commons_image(query: str) -> str | None:
 
 def openverse_image(query: str) -> str | None:
     """Topical CC image from Openverse — works for restaurants/hotels too."""
+    global _OPENVERSE_DISABLED_UNTIL
+    if time.time() < _OPENVERSE_DISABLED_UNTIL:
+        return None
     data = _get_json(settings.OPENVERSE_IMAGES_URL,
-                     params={"q": query, "page_size": 1, "license_type": "all"})
+                     params={"q": query, "page_size": 1, "license_type": "all"},
+                     timeout=_IMAGE_TIMEOUT)
     if not data:
+        # If openverse fails or times out, back off for 5 minutes so subsequent requests don't hang
+        _OPENVERSE_DISABLED_UNTIL = time.time() + 300.0
         return None
     results = data.get("results") or []
     if results:
