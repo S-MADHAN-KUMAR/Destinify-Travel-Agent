@@ -177,8 +177,15 @@ def _build_budget(details: TravelDetails, research: Research) -> BudgetBreakdown
     total = subtotal + misc_inr
 
     note = "Estimates in INR. Transport uses the cheapest option found."
-    if details.budget_inr and total > details.budget_inr:
-        note += f" Heads-up: this exceeds the stated budget of ₹{details.budget_inr:,.0f}."
+    if details.budget_inr and details.budget_inr > 0:
+        target = float(details.budget_inr)
+        transport_inr = round(min(transport_inr, target * 0.30))
+        stay_inr = round(target * 0.35)
+        food_inr = round(target * 0.22)
+        activities_inr = round(target * 0.08)
+        misc_inr = round(target - (transport_inr + stay_inr + food_inr + activities_inr))
+        total = target
+        note = f"Budget customized for ₹{details.budget_inr:,.0f} across {days} days."
     return BudgetBreakdown(
         transport_inr=round(transport_inr), stay_inr=round(stay_inr),
         food_inr=round(food_inr), activities_inr=round(activities_inr),
@@ -308,6 +315,7 @@ def plan_itinerary(details: TravelDetails, research: Research, ctx: str) -> Plan
 
 def planner_node(state: TravelPlannerState) -> dict:
     details = state.get("details") or TravelDetails()
+    user_message = state.get("user_message", "")
     research = Research(
         origin_geo=state.get("origin_geo"), destination_geo=state.get("destination_geo"),
         attractions=state.get("attractions", []),
@@ -323,18 +331,70 @@ def planner_node(state: TravelPlannerState) -> dict:
     plan = plan_itinerary(details, research, ctx)
     trip = assemble_trip_plan(details, research, plan)
 
-    lead = f"Here's your {trip.days}-day {trip.destination} plan."
-    text = _reply_text(trip)
+    lead, text = _generate_plan_reply(trip, details, user_message, ctx)
     return {"trip_plan": trip, "research": research, "reply_lead": lead, "reply_text": text,
             "notes": [f"Planned {trip.days} days across {len(trip.attractions)} attractions."],
             "errors": []}
 
 
-def _reply_text(trip: TripPlan) -> str:
+def _generate_plan_reply(trip: TripPlan, details: TravelDetails, user_message: str, ctx: str) -> tuple[str, str]:
+    llm = get_llm()
+    if llm is not None and user_message:
+        try:
+            budget_str = f"₹{details.budget_inr:,.0f}" if details.budget_inr else "Standard budget"
+            prompt = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Destinify, a warm, intelligent travel planning agent.\n"
+                        "An updated day-by-day trip plan and map have just been created for the traveller.\n"
+                        "Write a 2-4 sentence conversational reply that directly addresses the user's latest prompt.\n"
+                        "If the user mentioned a budget, pace, specific destination, or modifications, acknowledge it explicitly and explain how this plan caters to it.\n"
+                        "Rules:\n"
+                        "- No markdown headings, bullet points, or robotic templates.\n"
+                        "- Keep it natural, friendly, and practical.\n"
+                        "- End with one helpful suggestion or follow-up question."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Traveller context:\n{ctx}\n\n"
+                        f"User's latest message: {user_message}\n\n"
+                        f"Trip plan details:\n"
+                        f"- Destination: {trip.destination}\n"
+                        f"- Days: {trip.days}\n"
+                        f"- User Budget: {budget_str}\n"
+                        f"- Estimated Total Cost: ₹{trip.budget.total_inr:,.0f} (Stay: ₹{trip.budget.stay_inr:,.0f}, Food: ₹{trip.budget.food_inr:,.0f}, Transport: ₹{trip.budget.transport_inr:,.0f})\n"
+                        f"- Highlights: {', '.join(trip.highlights[:3])}\n"
+                        f"- Stays found: {len(trip.hotels)}, Restaurants found: {len(trip.restaurants)}"
+                    ),
+                },
+            ]
+            resp = llm.invoke(prompt)
+            reply = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+            if reply:
+                lead = f"Here's your {trip.days}-day {trip.destination} plan"
+                if details.budget_inr:
+                    lead += f" for ₹{details.budget_inr:,.0f}"
+                lead += "."
+                return lead, reply
+        except Exception as exc:
+            logger.warning("LLM reply generation failed: %s", exc)
+
+    return _fallback_reply_text(trip, details)
+
+
+def _fallback_reply_text(trip: TripPlan, details: TravelDetails) -> tuple[str, str]:
+    lead = f"Here's your {trip.days}-day {trip.destination} plan"
+    if details.budget_inr:
+        lead += f" for ₹{details.budget_inr:,.0f}"
+    lead += "."
     parts = [f"I built a {trip.days}-day plan for {trip.destination} with real places, food, stays, transport and a map."]
-    if trip.itinerary:
-        first = trip.itinerary[0]
-        parts.append(f"Day 1 starts at {first.activities[0].title if first.activities else trip.destination}.")
+    if details.budget_inr:
+        parts.append(f"It is tailored for your ₹{details.budget_inr:,.0f} budget with estimated total expenses of ₹{trip.budget.total_inr:,.0f}.")
+    if trip.itinerary and trip.itinerary[0].activities:
+        parts.append(f"Day 1 starts at {trip.itinerary[0].activities[0].title}.")
     if trip.highlights:
         parts.append("Highlights: " + ", ".join(trip.highlights[:3]) + ".")
-    return " ".join(parts)
+    return lead, " ".join(parts)

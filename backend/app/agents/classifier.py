@@ -237,8 +237,21 @@ def heuristic_extract(message: str) -> TravelDetails:
 
     pm = re.search(r"(\d+)\s*(?:passenger|person|people|traveller|traveler|adult)", lower)
     travellers = int(pm.group(1)) if pm else 1
-    bm = re.search(r"(?:rs\.?|inr|₹)\s*([\d,]+)", lower)
-    budget = float(bm.group(1).replace(",", "")) if bm else None
+
+    bm = re.search(
+        r"(?:(?:budget|cost|price|max|under|below|spend)\s*(?:is|of|around|approx)?\s*(?:only)?\s*(?:rs\.?|inr|₹)?|(?:rs\.?|inr|₹))\s*([\d,]+)\s*(k)?\b|"
+        r"([\d,]+)\s*(k)?\s*(?:rs\.?|inr|₹|budget|rupees)",
+        lower,
+    )
+    budget = None
+    if bm:
+        val_str = bm.group(1) or bm.group(3)
+        is_k = bool(bm.group(2) or bm.group(4))
+        if val_str:
+            val = float(val_str.replace(",", ""))
+            if is_k and val < 100:
+                val *= 1000
+            budget = val
 
     interest_map = {
         "food": ["food", "eat", "cuisine", "restaurant"],
@@ -342,11 +355,11 @@ def classifier_node(state: TravelPlannerState) -> dict:
     details = extract_travel_details(full_message, long)
     details.raw_message = message
 
-    # The latest message is authoritative for concrete facts (the LLM sees the
-    # conversation too and can echo an older "3 days" over "make it 5 days").
     facts = heuristic_extract(message)
     if facts.days is not None:
         details.days = facts.days
+    if facts.budget_inr is not None:
+        details.budget_inr = facts.budget_inr
     details.origin = details.origin or facts.origin
     details.start_date = details.start_date or facts.start_date
 
@@ -357,6 +370,14 @@ def classifier_node(state: TravelPlannerState) -> dict:
         details.destination = None
     elif not details.destination and long.past_destinations:
         details.destination = long.past_destinations[-1]
+
+    # Also recover days from prior turn if omitted in the follow-up
+    if details.days is None and payload.short:
+        for t in reversed(payload.short):
+            m_days = re.search(r"Planned\s+(\d+)\s+days", t.text)
+            if m_days:
+                details.days = int(m_days.group(1))
+                break
 
     # Reconcile the LLM/heuristic intent with what the message is really asking:
     #  - plan-shaped message + "general"  -> plan it

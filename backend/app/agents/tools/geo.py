@@ -16,6 +16,7 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 from math import cos, radians
 from typing import Any
 
@@ -130,28 +131,9 @@ def _overpass_fetch(url: str, query: str) -> list[dict]:
 
 
 def _overpass(query: str) -> list[dict]:
-    """POST an Overpass QL query with mirror failover. Returns elements (or []).
-
-    The first two mirrors are raced concurrently and the first good answer wins
-    — the public instances are individually flaky, and waiting for one timeout
-    after another made a single city query take a minute.
-    """
+    """POST an Overpass QL query with mirror failover. Returns elements (or [])."""
     mirrors = list(settings.OVERPASS_MIRRORS or [settings.OVERPASS_URL])
-    head, tail = mirrors[:2], mirrors[2:]
-    if len(head) > 1:
-        with ThreadPoolExecutor(max_workers=len(head), thread_name_prefix="overpass") as pool:
-            futures = [pool.submit(_overpass_fetch, url, query) for url in head]
-            for fut in as_completed(futures):
-                elements = fut.result()
-                if elements:
-                    for pending in futures:
-                        pending.cancel()
-                    return elements
-    else:
-        for url in head:
-            if elements := _overpass_fetch(url, query):
-                return elements
-    for url in tail:  # fall back to the remaining mirrors one at a time
+    for url in mirrors:
         if elements := _overpass_fetch(url, query):
             return elements
     return []
@@ -258,7 +240,8 @@ def wikipedia_article(title: str) -> dict | None:
     key = f"wiki:{title.lower().strip()}"
     if (hit := _cached(key)) is not None:
         return hit
-    data = _get_json(settings.WIKIPEDIA_SUMMARY_URL.format(title=title.replace(" ", "_")))
+    safe_title = quote(title.replace(" ", "_"), safe="")
+    data = _get_json(settings.WIKIPEDIA_SUMMARY_URL.format(title=safe_title))
     if not data:
         return None
     thumb = (data.get("thumbnail") or {}).get("source")
@@ -324,12 +307,12 @@ def image_for(name: str, *, city: str = "", kind: str = "place") -> str | None:
 
 
 def food_image(name: str, cuisine: str = "", city: str = "") -> str | None:
-    """Real food/venue image for a restaurant (Openverse first — no wiki article)."""
+    """Real food/venue image for a restaurant."""
     key = f"img:food:{name.lower().strip()}|{city.lower().strip()}"
     if (hit := _cached(key)) is not None:
         return hit
-    img = openverse_image(f"{name} {cuisine} {city}".strip()) or openverse_image(
-        f"{cuisine} restaurant {city}".strip())
+    img = (commons_image(f"{cuisine} food".strip())
+           or openverse_image(f"{name} {cuisine} {city}".strip()))
     return _store(key, img)
 
 
@@ -342,10 +325,10 @@ def distinct_image(img: str | None, used: set[str]) -> str | None:
 
 
 def hotel_image(name: str, city: str = "") -> str | None:
-    """Prefer a real photo of the property (Openverse) over a chain logo."""
-    return (openverse_image(f"{name} hotel {city}".strip())
-            or openverse_image(f"{name} {city}".strip())
-            or wikipedia_image(name))
+    """Prefer a real photo of the property."""
+    return (wikipedia_image(name)
+            or commons_image(f"{name} hotel".strip())
+            or openverse_image(f"{name} {city}".strip()))
 
 
 def place_media(name: str, city: str) -> dict:
@@ -353,8 +336,7 @@ def place_media(name: str, city: str) -> dict:
     article = wikipedia_article(name) or {}
     img = article.get("image")
     if not img:
-        img = ((openverse_image(f"{name} {city}") or "").strip()
-               or commons_image(f"{name} {city}"))
+        img = commons_image(f"{name} {city}".strip()) or openverse_image(f"{name} {city}".strip())
     return {"image": img or None, "extract": article.get("extract", ""), "url": article.get("url")}
 
 
@@ -447,6 +429,8 @@ def search_restaurants(city: str, limit: int = 22) -> tuple[list[Restaurant], li
         return [], [f"Could not geocode '{city}'."]
     pois = _pois(geo, "restaurants", radius=4000, limit=limit)
     if not pois:
+        pois = _pois(geo, "restaurants", radius=25000, limit=limit)
+    if not pois:
         notes.append(f"No OpenStreetMap restaurants found near {geo.get('city', city)}.")
         return [], notes
 
@@ -477,6 +461,8 @@ def search_hotels(city: str, limit: int = 16) -> tuple[list[Hotel], list[str]]:
     if not geo:
         return [], [f"Could not geocode '{city}'."]
     pois = _pois(geo, "stay", radius=6000, limit=limit)
+    if not pois:
+        pois = _pois(geo, "stay", radius=25000, limit=limit)
     if not pois:
         notes.append(f"No OpenStreetMap stays found near {geo.get('city', city)}.")
         return [], notes
